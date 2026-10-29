@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
-  "Version": 3,
-  "VersionName": "2.1",
+  "Version": 5,
+  "VersionName": "2.3",
   "FriendlyName": "Blueprint Graph Audit",
-  "Description": "Read-only, project-wide Blueprint graph and Enhanced Input export with asset inventory changes.",
+  "Description": "Read-only Blueprint graph export with compact summaries and cross-Blueprint reference index.",
   "Category": "Editor",
   "CanContainContent": false,
   "Installed": false,

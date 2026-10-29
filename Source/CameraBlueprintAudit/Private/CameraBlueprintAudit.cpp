@@ -3,6 +3,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "HAL/PlatformFileManager.h"
+#include "HAL/FileManager.h"
 #include "Misc/DateTime.h"
 #include "Misc/Guid.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -12,7 +13,9 @@
 #include "Engine/SCS_Node.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
+#include "EdGraph/EdGraphPin.h"
 #include "EdGraphUtilities.h"
+#include "K2Node_CallFunction.h"
 #include "InputAction.h"
 #include "InputMappingContext.h"
 #include "UObject/UObjectGlobals.h"
@@ -103,6 +106,36 @@ namespace CameraBlueprintAudit
             return A.PackageName.LexicalLess(B.PackageName);
         });
 
+        // Include all /Game Blueprint package names so a scoped export can still name outside targets.
+        FARFilter UniverseFilter = Filter;
+        UniverseFilter.PackagePaths.Reset();
+        UniverseFilter.PackagePaths.Add(FName(TEXT("/Game")));
+        TArray<FAssetData> UniverseAssets;
+        Registry.GetAssets(UniverseFilter, UniverseAssets);
+        TSet<FName> BlueprintPackages;
+        for (const FAssetData& BlueprintAsset : UniverseAssets)
+            BlueprintPackages.Add(BlueprintAsset.PackageName);
+
+        TSet<FString> RelationRows;
+        TMap<FString, TArray<FString>> Outgoing;
+        TMap<FString, TArray<FString>> Incoming;
+        auto AddRelation = [&](const FString& Source, const FString& Kind,
+            const FString& Target, const FString& GraphFile, const FString& Member)
+        {
+            if (Source == Target) return;
+            const FString Row = Source + TEXT("\t") + Kind + TEXT("\t") + Target +
+                TEXT("\t") + GraphFile + TEXT("\t") + Member;
+            if (RelationRows.Contains(Row)) return;
+            RelationRows.Add(Row);
+            const FString Detail = Kind + TEXT("  ") + Target +
+                (Member.IsEmpty() ? TEXT("") : TEXT("::") + Member) +
+                (GraphFile.IsEmpty() ? TEXT("") : TEXT("  [") + GraphFile + TEXT("]"));
+            Outgoing.FindOrAdd(Source).Add(Detail);
+            Incoming.FindOrAdd(Target).Add(Kind + TEXT("  ") + Source +
+                (Member.IsEmpty() ? TEXT("") : TEXT("::") + Member) +
+                (GraphFile.IsEmpty() ? TEXT("") : TEXT("  [") + GraphFile + TEXT("]")));
+        };
+
         FString AssetPaths;
         TSet<FString> CurrentPaths;
         for (const FAssetData& Asset : Assets)
@@ -111,19 +144,30 @@ namespace CameraBlueprintAudit
             AssetPaths += Path + TEXT("\n");
             CurrentPaths.Add(Path);
         }
-        const FString PreviousPointer = FPaths::Combine(Root, TEXT("LATEST.txt"));
         FString PreviousRun;
         FString PreviousPaths;
         FString Changes;
-        bool bHasPrevious = FFileHelper::LoadFileToString(PreviousRun, *PreviousPointer);
-        PreviousRun.TrimStartAndEndInline();
-        // Read only our own prior report, and only when it has an asset manifest.
-        const FString NormalizedRoot = FPaths::ConvertRelativePathToFull(Root);
-        const FString NormalizedPrevious = FPaths::ConvertRelativePathToFull(PreviousRun);
-        bHasPrevious = bHasPrevious &&
-            NormalizedPrevious.StartsWith(NormalizedRoot + TEXT("/")) &&
-            FFileHelper::LoadFileToString(PreviousPaths,
-                *FPaths::Combine(PreviousRun, TEXT("AssetPaths.txt")));
+        bool bHasPrevious = false;
+        TArray<FString> RunNames;
+        IFileManager::Get().FindFiles(RunNames, *FPaths::Combine(Root, TEXT("Runs"), TEXT("*")),
+            false, true);
+        RunNames.Sort([](const FString& A, const FString& B) { return A > B; });
+        for (const FString& Name : RunNames)
+        {
+            const FString Candidate = FPaths::Combine(Root, TEXT("Runs"), Name);
+            FString PriorIndex;
+            if (!FFileHelper::LoadFileToString(PriorIndex, *FPaths::Combine(Candidate, TEXT("INDEX.txt"))))
+                continue;
+            if (!PriorIndex.Contains(TEXT("\nScope: ") + Scope + TEXT("\n")))
+                continue;
+            if (FFileHelper::LoadFileToString(PreviousPaths,
+                *FPaths::Combine(Candidate, TEXT("AssetPaths.txt"))))
+            {
+                PreviousRun = Candidate;
+                bHasPrevious = true;
+                break;
+            }
+        }
         int32 Added = 0;
         int32 Removed = 0;
         if (bHasPrevious)
@@ -216,8 +260,108 @@ namespace CameraBlueprintAudit
                 if (!bSaved) ++Failures;
                 Index += FString::Printf(TEXT("  %s: %d nodes%s\n"), *Filename, Nodes.Num(),
                     bSaved ? TEXT("") : TEXT(" [SAVE FAILED]"));
+
+                // Compact graph view: linked pins and meaningful unlinked input defaults.
+                FString Summary = FString::Printf(TEXT("%s :: %s\n"), *Asset.PackageName.ToString(),
+                    *Graph->GetName());
+                TMap<const UEdGraphNode*, int32> NodeNumbers;
+                for (int32 NodeIndex = 0; NodeIndex < Graph->Nodes.Num(); ++NodeIndex)
+                    if (Graph->Nodes[NodeIndex]) NodeNumbers.Add(Graph->Nodes[NodeIndex], NodeIndex);
+                for (int32 NodeIndex = 0; NodeIndex < Graph->Nodes.Num(); ++NodeIndex)
+                {
+                    const UEdGraphNode* Node = Graph->Nodes[NodeIndex];
+                    if (!Node) continue;
+                    FString Title = Node->GetNodeTitle(ENodeTitleType::ListView).ToString();
+                    Title.ReplaceInline(TEXT("\r"), TEXT(" "));
+                    Title.ReplaceInline(TEXT("\n"), TEXT(" "));
+                    Summary += FString::Printf(TEXT("#%d %s | %s\n"), NodeIndex,
+                        *Node->GetClass()->GetName(), *Title);
+                    for (const UEdGraphPin* Pin : Node->Pins)
+                    {
+                        if (!Pin || Pin->bHidden) continue;
+                        const FString PinName = Pin->PinName.IsNone() ? TEXT("<unnamed>") : Pin->PinName.ToString();
+                        const TCHAR* Direction = Pin->Direction == EGPD_Input ? TEXT("in") : TEXT("out");
+                        FString Destinations;
+                        for (const UEdGraphPin* Linked : Pin->LinkedTo)
+                        {
+                            if (!Linked || !Linked->GetOwningNode()) continue;
+                            if (const int32* TargetNumber = NodeNumbers.Find(Linked->GetOwningNode()))
+                            {
+                                if (!Destinations.IsEmpty()) Destinations += TEXT(", ");
+                                Destinations += FString::Printf(TEXT("#%d.%s"), *TargetNumber,
+                                    *Linked->PinName.ToString());
+                            }
+                        }
+                        FString Default;
+                        if (Pin->Direction == EGPD_Input && Destinations.IsEmpty())
+                        {
+                            Default = Pin->DefaultValue;
+                            if (Pin->DefaultObject) Default = Pin->DefaultObject->GetPathName();
+                            if (Default.Len() > 160) Default = Default.Left(160) + TEXT("...");
+                        }
+                        if (!Destinations.IsEmpty() || !Default.IsEmpty())
+                            Summary += FString::Printf(TEXT("  %s %s:%s%s%s\n"), Direction,
+                                *Pin->PinType.PinCategory.ToString(), *PinName,
+                                Destinations.IsEmpty() ? TEXT(" = ") : TEXT(" -> "),
+                                Destinations.IsEmpty() ? *Default : *Destinations);
+                    }
+                }
+                const FString SummaryFile = Filename.LeftChop(4) + TEXT(".summary.txt");
+                if (!Save(FPaths::Combine(AssetDir, TEXT("graphs"), SummaryFile), Summary))
+                    ++Failures;
+                for (const UEdGraphNode* Node : Graph->Nodes)
+                {
+                    const UK2Node_CallFunction* Call = Cast<UK2Node_CallFunction>(Node);
+                    if (!Call) continue;
+                    const UClass* Owner = Call->FunctionReference.GetMemberParentClass(Blueprint->GeneratedClass);
+                    if (!Owner) continue;
+                    const FName TargetPackage = Owner->GetOutermost()->GetFName();
+                    if (BlueprintPackages.Contains(TargetPackage))
+                        AddRelation(Asset.PackageName.ToString(), TEXT("CALL"),
+                            TargetPackage.ToString(), Filename, Call->GetFunctionName().ToString());
+                }
             }
+            TArray<FName> Dependencies;
+            Registry.GetDependencies(Asset.PackageName, Dependencies,
+                UE::AssetRegistry::EDependencyCategory::Package);
+            for (const FName& Dependency : Dependencies)
+                if (BlueprintPackages.Contains(Dependency))
+                    AddRelation(Asset.PackageName.ToString(), TEXT("ASSET_REF"),
+                        Dependency.ToString(), TEXT(""), TEXT(""));
         }
+
+        FString Relationships = TEXT("source\tkind\ttarget\tgraph_file\tfunction\n");
+        TArray<FString> SortedRelations;
+        for (const FString& Row : RelationRows) SortedRelations.Add(Row);
+        SortedRelations.Sort();
+        for (const FString& Row : SortedRelations) Relationships += Row + TEXT("\n");
+        if (!Save(FPaths::Combine(RunDir, TEXT("BlueprintReferences.tsv")), Relationships))
+            ++Failures;
+
+        FString ReferenceIndex = TEXT("Blueprint reference index (exported scope: ") + Scope +
+            TEXT(")\nCALL = function declared on the named Blueprint; runtime target may differ.\n") +
+            TEXT("ASSET_REF = package dependency; it does not prove a function call.\n") +
+            TEXT("Incoming links include only Blueprints exported in this run.\n\n");
+        for (const FAssetData& Asset : Assets)
+        {
+            const FString Path = Asset.PackageName.ToString();
+            ReferenceIndex += Path + TEXT("\n");
+            if (TArray<FString>* Entries = Outgoing.Find(Path))
+            {
+                Entries->Sort();
+                ReferenceIndex += TEXT("  Outgoing:\n");
+                for (const FString& Entry : *Entries) ReferenceIndex += TEXT("    ") + Entry + TEXT("\n");
+            }
+            if (TArray<FString>* Entries = Incoming.Find(Path))
+            {
+                Entries->Sort();
+                ReferenceIndex += TEXT("  Referenced by:\n");
+                for (const FString& Entry : *Entries) ReferenceIndex += TEXT("    ") + Entry + TEXT("\n");
+            }
+            ReferenceIndex += TEXT("\n");
+        }
+        if (!Save(FPaths::Combine(RunDir, TEXT("ReferenceIndex.txt")), ReferenceIndex))
+            ++Failures;
 
         FARFilter InputFilter;
         InputFilter.PackagePaths.Add(FName(*Scope));
@@ -256,8 +400,8 @@ namespace CameraBlueprintAudit
             }
         }
         if (!Save(FPaths::Combine(RunDir, TEXT("InputMappings.txt")), Mappings)) ++Failures;
-        Index += FString::Printf(TEXT("\nBlueprints exported: %d / %d\nInput assets: %d\nFailures: %d\nAdded since prior run: %d\nRemoved since prior run: %d\n"),
-            Exported, Assets.Num(), Inputs.Num(), Failures, Added, Removed);
+        Index += FString::Printf(TEXT("\nBlueprints exported: %d / %d\nInput assets: %d\nReference links: %d\nFailures: %d\nAdded since prior run: %d\nRemoved since prior run: %d\n"),
+            Exported, Assets.Num(), Inputs.Num(), RelationRows.Num(), Failures, Added, Removed);
         if (Save(FPaths::Combine(RunDir, TEXT("INDEX.txt")), Index) &&
             Save(FPaths::Combine(Root, TEXT("LATEST.txt")), RunDir + TEXT("\n")))
         {

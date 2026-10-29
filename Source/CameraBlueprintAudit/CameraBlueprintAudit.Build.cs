@@ -7,8 +7,9 @@ public class CameraBlueprintAudit : ModuleRules
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
         PrivateDependencyModuleNames.AddRange(new string[]
         {
-            "Core", "CoreUObject", "Engine", "UnrealEd", "EnhancedInput", "InputCore", "AssetRegistry"
+            "Core", "CoreUObject", "Engine", "UnrealEd", "EnhancedInput", "InputCore", "AssetRegistry", "BlueprintGraph"
         });
     }
 }
+
 
