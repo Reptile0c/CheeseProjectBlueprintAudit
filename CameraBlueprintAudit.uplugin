@@ -1,0 +1,23 @@
+{
+  "FileVersion": 3,
+  "Version": 3,
+  "VersionName": "2.1",
+  "FriendlyName": "Blueprint Graph Audit",
+  "Description": "Read-only, project-wide Blueprint graph and Enhanced Input export with asset inventory changes.",
+  "Category": "Editor",
+  "CanContainContent": false,
+  "Installed": false,
+  "Plugins": [
+    {
+      "Name": "EnhancedInput",
+      "Enabled": true
+    }
+  ],
+  "Modules": [
+    {
+      "Name": "CameraBlueprintAudit",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    }
+  ]
+}
